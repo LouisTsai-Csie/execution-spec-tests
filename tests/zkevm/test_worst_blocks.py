@@ -163,7 +163,6 @@ def test_block_full_of_ether_transfers(
 def test_block_full_of_7702_set_code(
     blockchain_test: BlockchainTestFiller,
     pre: Alloc,
-    env: Environment,
     iteration_count: int,
 ):
     """
@@ -171,6 +170,7 @@ def test_block_full_of_7702_set_code(
 
     This test is designed to test the worst-case block scenario with 7702 set code.
     """
+    env = Environment()
     attack_gas_limit = env.gas_limit
     sender = pre.fund_eoa()
 
@@ -194,6 +194,7 @@ def test_block_full_of_7702_set_code(
     blockchain_test(
         genesis_environment=env,
         pre=pre,
+        post={},
         blocks=[Block(txs=txs)],
         exclude_full_post_state_in_output=True,
     )
