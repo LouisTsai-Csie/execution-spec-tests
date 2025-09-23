@@ -98,7 +98,7 @@ def pytest_configure(config: pytest.Config):
     )
     config.addinivalue_line(
         "markers",
-        "state: Tests for stateful benchmarking scenarios.",
+        "stateful: Tests for stateful benchmarking scenarios.",
     )
     config.addinivalue_line(
         "markers",
