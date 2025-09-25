@@ -6,6 +6,7 @@ import math
 
 import pytest
 
+from ethereum_test_base_types import Address
 from ethereum_test_benchmark.benchmark_code_generator import JumpLoopGenerator
 from ethereum_test_forks import Fork
 from ethereum_test_tools import (
@@ -32,88 +33,12 @@ XOR_TABLE_SIZE = 256
 XOR_TABLE = [Hash(i).sha256() for i in range(XOR_TABLE_SIZE)]
 
 
-@pytest.mark.parametrize(
-    "opcode",
-    [
-        Op.EXTCODESIZE,
-        Op.EXTCODEHASH,
-        Op.CALL,
-        Op.CALLCODE,
-        Op.DELEGATECALL,
-        Op.STATICCALL,
-        Op.EXTCODECOPY,
-    ],
-)
-def test_worst_bytecode_single_opcode(
-    blockchain_test: BlockchainTestFiller,
-    pre: Alloc,
-    fork: Fork,
-    opcode: Op,
-    env: Environment,
-    gas_benchmark_value: int,
-):
-    """
-    Test a block execution where a single opcode execution maxes out the gas
-    limit, and the opcodes access a huge amount of contract code.
-
-    We first use a single block to deploy a factory contract that will be used
-    to deploy a large number of contracts.
-
-    This is done to avoid having a big pre-allocation size for the test.
-
-    The test is performed in the last block of the test, and the entire block
-    gas limit is consumed by repeated opcode executions.
-    """
-    # The attack gas limit is the gas limit which the target tx will use The
-    # test will scale the block gas limit to setup the contracts accordingly to
-    # be able to pay for the contract deposit. This has to take into account
-    # the 200 gas per byte, but also the quadratic memory expansion costs which
-    # have to be paid each time the memory is being setup
-    attack_gas_limit = gas_benchmark_value
-    max_contract_size = fork.max_code_size()
-
-    gas_costs = fork.gas_costs()
-
-    # Calculate the absolute minimum gas costs to deploy the contract This does
-    # not take into account setting up the actual memory (using KECCAK256 and
-    # XOR) so the actual costs of deploying the contract is higher
-    memory_expansion_gas_calculator = fork.memory_expansion_gas_calculator()
-    memory_gas_minimum = memory_expansion_gas_calculator(new_bytes=len(bytes(max_contract_size)))
-    code_deposit_gas_minimum = (
-        fork.gas_costs().G_CODE_DEPOSIT_BYTE * max_contract_size + memory_gas_minimum
-    )
-
-    intrinsic_gas_cost_calc = fork.transaction_intrinsic_cost_calculator()
-    # Calculate the loop cost of the attacker to query one address
-    loop_cost = (
-        gas_costs.G_KECCAK_256  # KECCAK static cost
-        + math.ceil(85 / 32) * gas_costs.G_KECCAK_256_WORD  # KECCAK dynamic
-        # cost for CREATE2
-        + gas_costs.G_VERY_LOW * 3  # ~MSTOREs+ADDs
-        + gas_costs.G_COLD_ACCOUNT_ACCESS  # Opcode cost
-        + 30  # ~Gluing opcodes
-    )
-    # Calculate the number of contracts to be targeted
-    num_contracts = (
-        # Base available gas = GAS_LIMIT - intrinsic - (out of loop MSTOREs)
-        attack_gas_limit - intrinsic_gas_cost_calc() - gas_costs.G_VERY_LOW * 4
-    ) // loop_cost
-
-    # Set the block gas limit to a relative high value to ensure the code
-    # deposit tx fits in the block (there is enough gas available in the block
-    # to execute this)
-    minimum_gas_limit = code_deposit_gas_minimum * 2 * num_contracts
-    if env.gas_limit < minimum_gas_limit:
-        raise Exception(
-            f"`BENCHMARKING_MAX_GAS` ({env.gas_limit}) is no longer enough to support this test, "
-            f"which requires {minimum_gas_limit} gas for its setup. Update the value or consider "
-            "optimizing gas usage during the setup phase of this test."
-        )
-
-    # The initcode will take its address as a starting point to the input to
-    # the keccak hash function. It will reuse the output of the hash function
-    # in a loop to create a large amount of seemingly random code, until it
-    # reaches the maximum contract size.
+def deploy_initcode_template(pre: Alloc, fork: Fork) -> tuple[Address, Bytecode]:
+    """Deploy the initcode template contract."""
+    # The initcode will take its address as a starting point to the input to the keccak
+    # hash function.
+    # It will reuse the output of the hash function in a loop to create a large amount of
+    # seemingly random code, until it reaches the maximum contract size.
     initcode = (
         Op.MSTORE(0, Op.ADDRESS)
         + While(
@@ -127,18 +52,21 @@ def test_worst_bytecode_single_opcode(
                 )
                 + Op.POP
             ),
-            condition=Op.LT(Op.MSIZE, max_contract_size),
+            condition=Op.LT(Op.MSIZE, fork.max_code_size()),
         )
         # Despite the whole contract has random bytecode, we make the first
         # opcode be a STOP so CALL-like attacks return as soon as possible,
         # while EXTCODE(HASH|SIZE) work as intended.
         + Op.MSTORE8(0, 0x00)
-        + Op.RETURN(0, max_contract_size)
+        + Op.RETURN(0, fork.max_code_size())
     )
-    initcode_address = pre.deploy_contract(code=initcode)
+    return pre.deploy_contract(code=initcode), initcode
 
-    # The factory contract will simply use the initcode that is already
-    # deployed, and create a new contract and return its address if successful.
+
+def deploy_factory_contract(pre: Alloc, fork: Fork, initcode_address: Address) -> Address:
+    """Deploy the factory contract."""
+    # The factory contract will simply use the initcode that is already deployed,
+    # and create a new contract and return its address if successful.
     factory_code = (
         Op.EXTCODECOPY(
             address=initcode_address,
@@ -158,27 +86,185 @@ def test_worst_bytecode_single_opcode(
         + Op.SSTORE(0, Op.ADD(Op.SLOAD(0), 1))
         + Op.RETURN(0, 32)
     )
-    factory_address = pre.deploy_contract(code=factory_code)
+    return pre.deploy_contract(code=factory_code)
 
-    # The factory caller will call the factory contract N times, creating N new
-    # contracts. Calldata should contain the N value.
+
+def deploy_factory_caller_contract(pre: Alloc, fork: Fork, factory_address: Address) -> Address:
+    """Deploy the factory caller contract."""
+    # The factory caller will call the factory contract N times, creating N new contracts.
+    # Calldata should contain the N value.
     factory_caller_code = Op.CALLDATALOAD(0) + While(
         body=Op.POP(Op.CALL(address=factory_address)),
         condition=Op.PUSH1(1) + Op.SWAP1 + Op.SUB + Op.DUP1 + Op.ISZERO + Op.ISZERO,
     )
-    factory_caller_address = pre.deploy_contract(code=factory_caller_code)
 
-    contracts_deployment_tx = Transaction(
-        to=factory_caller_address,
-        gas_limit=env.gas_limit,
-        gas_price=10**6,
-        data=Hash(num_contracts),
-        sender=pre.fund_eoa(),
+    return pre.deploy_contract(code=factory_caller_code)
+
+
+def deploy_attack_contract(
+    pre: Alloc, fork: Fork, factory_address: Address, initcode: Bytecode, opcode: Op
+) -> Address:
+    """Deploy the attack contract."""
+    # Setup memory for later CREATE2 address generation loop.
+    # 0xFF+[Address(20bytes)]+[seed(32bytes)]+[initcode keccak(32bytes)]
+    setup = (
+        Op.MSTORE(0, factory_address)
+        + Op.MSTORE8(32 - 20 - 1, 0xFF)
+        + Op.CALLDATACOPY(dest_offset=32, offset=0, size=32)
+        + Op.MSTORE(64, initcode.keccak256())
     )
 
+    # setup_cost: G_VERY_LOW * 9 (PUSH) + G_VERY_LOW * 3 (MSTORE) + G_VERY_LOW (CALLDATACOPY)
+
+    # Attack call
+    attack_call = Bytecode()
+    if opcode == Op.EXTCODECOPY:
+        attack_call = Op.EXTCODECOPY(address=Op.SHA3(32 - 20 - 1, 85), dest_offset=96, size=1000)
+    else:
+        # For the rest of the opcodes, we can use the same generic attack call
+        # since all only minimally need the `address` of the target.
+        attack_call = Op.POP(opcode(address=Op.SHA3(32 - 20 - 1, 85)))
+
+    attack_code = setup + While(
+        body=attack_call + Op.MSTORE(32, Op.ADD(Op.MLOAD(32), 1)),
+    )
+
+    # loop_cost = (
+    #     gas_costs.G_KECCAK_256  KECCAK static cost
+    #     + math.ceil(85 / 32) * gas_costs.G_KECCAK_256_WORD  KECCAK dynamic cost for CREATE2
+    #     + gas_costs.G_VERY_LOW * ~MSTOREs+ADDs
+    #     + gas_costs.G_COLD_ACCOUNT_ACCESS Opcode cost
+    #     + 30 ~Gluing opcodes
+    # )
+
+    return pre.deploy_contract(code=attack_code)
+
+
+@pytest.mark.parametrize(
+    "opcode",
+    [
+        Op.EXTCODESIZE,
+        Op.EXTCODEHASH,
+        Op.CALL,
+        Op.CALLCODE,
+        Op.DELEGATECALL,
+        Op.STATICCALL,
+        Op.EXTCODECOPY,
+    ],
+)
+def test_worst_bytecode_single_opcode(
+    blockchain_test: BlockchainTestFiller,
+    pre: Alloc,
+    fork: Fork,
+    opcode: Op,
+    env: Environment,
+    gas_benchmark_value: int,
+    tx_gas_limit_cap: int,
+):
+    """
+    Test a block execution where a single opcode execution maxes out the gas limit,
+    and the opcodes access a huge amount of contract code.
+
+    We first use a single block to deploy a factory contract that will be used to deploy
+    a large number of contracts.
+
+    This is done to avoid having a big pre-allocation size for the test.
+
+    The test is performed in the last block of the test, and the entire block gas limit is
+    consumed by repeated opcode executions.
+    """
+    iteration_count = gas_benchmark_value // tx_gas_limit_cap
+
+    # The attack gas limit is the gas limit which the target tx will use
+    # The test will scale the block gas limit to setup the contracts accordingly to be
+    # able to pay for the contract deposit. This has to take into account the 200 gas per byte,
+    # but also the quadratic memory expansion costs which have to be paid each time the
+    # memory is being setup
+    max_contract_size = fork.max_code_size()
+
+    gas_costs = fork.gas_costs()
+
+    intrinsic_gas_cost_calc = fork.transaction_intrinsic_cost_calculator()
+    setup_cost = gas_costs.G_VERY_LOW * 13
+    # Calculate the loop cost of the attacker to query one address
+    loop_cost = (
+        gas_costs.G_KECCAK_256  # KECCAK static cost
+        + math.ceil(85 / 32) * gas_costs.G_KECCAK_256_WORD  # KECCAK dynamic cost for CREATE2
+        + gas_costs.G_VERY_LOW * 3  # ~MSTOREs+ADDs
+        + gas_costs.G_COLD_ACCOUNT_ACCESS  # Opcode cost
+        + 30  # ~Gluing opcodes
+    )
+
+    total_contracts = 0
+    gas_remaining = gas_benchmark_value
+    for _ in range(iteration_count):
+        gas_available = min(tx_gas_limit_cap, gas_remaining)
+        total_contracts += (
+            # Base available gas = GAS_LIMIT - intrinsic - (out of loop MSTOREs)
+            gas_available - intrinsic_gas_cost_calc() - setup_cost
+        ) // loop_cost
+        gas_remaining -= gas_available
+
+    # Deployment Phase - Deploy factory contract
+    initcode_address, initcode = deploy_initcode_template(pre, fork)
+    factory_address = deploy_factory_contract(pre, fork, initcode_address)
+    factory_caller_address = deploy_factory_caller_contract(pre, fork, factory_address)
+
+    # Deployment Phase - Deploy N contracts
+
+    # Calculate the absolute minimum gas costs to deploy the contract
+    # This does not take into account setting up the actual memory (using KECCAK256 and XOR)
+    # so the actual costs of deploying the contract is higher
+    memory_expansion_gas_calculator = fork.memory_expansion_gas_calculator()
+    memory_gas_minimum = memory_expansion_gas_calculator(new_bytes=len(bytes(max_contract_size)))
+    code_deposit_gas_minimum = (
+        fork.gas_costs().G_CODE_DEPOSIT_BYTE * max_contract_size + memory_gas_minimum
+    )
+
+    contracts_deployment_txs = []
+    deployment_cost_per_iteration = code_deposit_gas_minimum * 3
+    deployed_contract_num = 0
+    gas_remaining = gas_benchmark_value
+
+    while deployed_contract_num < total_contracts:
+        gas_available = min(tx_gas_limit_cap, gas_remaining)
+        gas_remaining -= gas_available
+        num = (gas_available - intrinsic_gas_cost_calc()) // deployment_cost_per_iteration
+        deployed_contract_num += num
+        contracts_deployment_txs.append(
+            Transaction(
+                to=factory_caller_address,
+                gas_limit=gas_available,
+                data=Hash(num),
+                sender=pre.fund_eoa(),
+            )
+        )
+
+    # Attack Phase
+    opcode_address = deploy_attack_contract(pre, fork, factory_address, initcode, opcode)
+
+    opcode_txs = []
+    gas_remaining = gas_benchmark_value
+    access_contract_index = 0
+
+    for _ in range(iteration_count):
+        gas_available = min(tx_gas_limit_cap, gas_remaining)
+        gas_remaining -= gas_available
+        num = (gas_available - intrinsic_gas_cost_calc() - setup_cost) // loop_cost
+        opcode_txs.append(
+            Transaction(
+                to=opcode_address,
+                data=Hash(access_contract_index),
+                gas_limit=gas_available,
+                sender=pre.fund_eoa(),
+            )
+        )
+        access_contract_index += num
+
+    # Post State Verification
     post = {}
     deployed_contract_addresses = []
-    for i in range(num_contracts):
+    for i in range(total_contracts):
         deployed_contract_address = compute_create2_address(
             address=factory_address,
             salt=i,
@@ -187,46 +273,13 @@ def test_worst_bytecode_single_opcode(
         post[deployed_contract_address] = Account(nonce=1)
         deployed_contract_addresses.append(deployed_contract_address)
 
-    attack_call = Bytecode()
-    if opcode == Op.EXTCODECOPY:
-        attack_call = Op.EXTCODECOPY(address=Op.SHA3(32 - 20 - 1, 85), dest_offset=96, size=1000)
-    else:
-        # For the rest of the opcodes, we can use the same generic attack call
-        # since all only minimally need the `address` of the target.
-        attack_call = Op.POP(opcode(address=Op.SHA3(32 - 20 - 1, 85)))
-    attack_code = (
-        # Setup memory for later CREATE2 address generation loop.
-        # 0xFF+[Address(20bytes)]+[seed(32bytes)]+[initcode keccak(32bytes)]
-        Op.MSTORE(0, factory_address)
-        + Op.MSTORE8(32 - 20 - 1, 0xFF)
-        + Op.MSTORE(32, 0)
-        + Op.MSTORE(64, initcode.keccak256())
-        # Main loop
-        + While(
-            body=attack_call + Op.MSTORE(32, Op.ADD(Op.MLOAD(32), 1)),
-        )
-    )
-
-    if len(attack_code) > max_contract_size:
-        # TODO: A workaround could be to split the opcode code into multiple
-        # contracts and call them in sequence.
-        raise ValueError(
-            f"Code size {len(attack_code)} exceeds maximum code size {max_contract_size}"
-        )
-    opcode_address = pre.deploy_contract(code=attack_code)
-    opcode_tx = Transaction(
-        to=opcode_address,
-        gas_limit=attack_gas_limit,
-        gas_price=10**9,
-        sender=pre.fund_eoa(),
-    )
-
+    # Blockchain Test Execution
     blockchain_test(
         pre=pre,
         post=post,
         blocks=[
-            Block(txs=[contracts_deployment_tx]),
-            Block(txs=[opcode_tx]),
+            Block(txs=contracts_deployment_txs),
+            Block(txs=opcode_txs),
         ],
         exclude_full_post_state_in_output=True,
     )
