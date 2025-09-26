@@ -21,12 +21,12 @@ class TestPhase(Enum):
 class TestPhaseManager:
     """
     Manages test phases and collects transactions and blocks by phase.
-    This class provides a mechanism for tracking "setup" and "execution" phases,
+    This class provides a mechanism for "setup" and "execution" phases,
     Only supports "setup" and "execution" phases now.
     """
 
     def __init__(self, *args, **kwargs):
-        """Initialize the TestPhaseManager with empty transaction and block lists."""
+        """Initialize TestPhaseManager with empty transactions and blocks."""
         self.setup_transactions: List = []
         self.setup_blocks: List = []
         self.execution_transactions: List = []

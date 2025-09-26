@@ -715,7 +715,10 @@ class BlockchainTest(BaseTest):
             raise e
 
     def _get_test_phase_blocks(self) -> List[Block]:
-        """Get additional blocks from benchmark manager setup and execution phases."""
+        """
+        Get additional blocks from phase manager for setup
+        and execution phases.
+        """
         assert self.test_phase_manager is not None, "Test phase manager is not set"
 
         blocks = []
